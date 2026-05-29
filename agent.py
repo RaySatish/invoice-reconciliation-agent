@@ -7,11 +7,12 @@ data through tool calls, reconciles the two, and drafts a response.
 
 import os
 import json
+import copy
 import logging
 from datetime import datetime, timezone
 
 from dotenv import load_dotenv
-from groq import Groq
+from groq import Groq, BadRequestError, RateLimitError
 
 load_dotenv()
 
@@ -23,15 +24,18 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-# -- Mock tools ---------------------------------------------------------------
-# These are the exact mock functions provided in the assessment.
-# In production, these would call real billing and CRM APIs.
+# Mock tools. These stand in for real billing and CRM APIs.
 
 def get_invoice_details(invoice_id: str) -> dict:
     if invoice_id == "INV-999":
         return "ERROR 502: BILLING DATABASE TIMEOUT"
 
-    return {"invoice_id": "INV-100", "total_billed": 500, "line_items": ["Platform Fee: $300", "Overage: $200"]}
+    # INV-100 is the only invoice that exists in this mock.
+    if invoice_id == "INV-100":
+        return {"invoice_id": "INV-100", "total_billed": 500, "line_items": ["Platform Fee: $300", "Overage: $200"]}
+
+    # Any other ID is a genuine not-found: the lookup succeeded but no record matches.
+    return {"status": "not_found", "invoice_id": invoice_id}
 
 
 def get_client_contract(client_email: str) -> dict:
@@ -44,7 +48,7 @@ TOOL_FUNCTIONS = {
 }
 
 
-# -- Tool schemas (for the Groq API) -----------------------------------------
+# The JSON schemas that tell the model which tools exist and how to call them.
 
 TOOLS = [
     {
@@ -92,7 +96,7 @@ TOOLS = [
 ]
 
 
-# -- System prompt ------------------------------------------------------------
+# The system prompt: persona, the tools available, and the reconciliation steps.
 
 SYSTEM_PROMPT = """You are an invoice reconciliation agent working in a billing support team. Your job is to investigate billing disputes raised by clients, determine whether discrepancies exist, and draft a clear, professional response.
 
@@ -121,18 +125,51 @@ Step 5: Draft a response to the client that:
 
 Constraints:
 - Only use data returned by the tools. Never fabricate amounts, line items, or contract terms.
-- If a tool returns an error or indicates a record was not found, acknowledge the failure honestly. Tell the client the issue is being escalated to the billing team for manual review. Do not guess or make up data.
+- If a tool returns a not-found result (for example {"status": "not_found"}), tell the client that no invoice matches the number they referenced and ask them to verify the invoice number. Do not escalate this case and do not invent a record.
+- If a tool returns an error string or an error code (for example a database timeout), tell the client that billing is temporarily unavailable and that their case has been escalated to the billing team for manual review.
+- In either case, never guess or fabricate invoice or contract data.
 - If the billing system times out or returns an error code, do not retry. Inform the client that there is a temporary system issue and their case has been flagged for follow-up.
 - Do not assume anything about the contract that was not returned by get_client_contract.
+- Your final answer must contain only the customer-facing email itself, starting with the greeting (for example "Dear Daniel,"). Do not include any internal reasoning, status notes, or preamble such as "I will escalate this" before the email. Keep that reasoning out of the draft entirely.
 - Be precise with dollar amounts."""
 
 
-# -- Test email ---------------------------------------------------------------
+# The sample client email the agent works from.
 
 TEST_EMAIL = "Hi, I am Daniel from Acme Corp. Why is invoice INV-100 for $500? We have overages waived on our Pro plan."
 
 
-# -- Execution loop -----------------------------------------------------------
+# Thin wrapper around the Groq call that retries on rate limits.
+
+def create_with_retry(client, *, model, messages, tools, max_attempts=3):
+    """
+    Call Groq with a small retry budget.
+
+    llama-3.3-70b-versatile sometimes emits a malformed tool-call token that Groq rejects
+    with a 400 'tool_use_failed'. Generation is non-deterministic, so a retry
+    usually clears it. Only that failure is retried; anything else is raised.
+    """
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return client.chat.completions.create(
+                model=model,
+                messages=messages,
+                tools=tools,
+                tool_choice="auto",
+            )
+        except BadRequestError as err:
+            if "tool_use_failed" in str(err) and attempt < max_attempts:
+                log.warning(
+                    "Model produced a malformed tool call (attempt %d/%d), retrying",
+                    attempt,
+                    max_attempts,
+                )
+                continue
+            raise
+
+
+# The agent loop: send the conversation, run any tool the model asks for, repeat
+# until it returns a final answer.
 
 def run_agent(email_body: str) -> dict:
     """
@@ -148,6 +185,11 @@ def run_agent(email_body: str) -> dict:
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": f"Client email:\n\n{email_body}"},
     ]
+
+    # Snapshot of the messages array exactly as it is sent to each API call.
+    # Each entry is the literal input for one request, deep-copied so later
+    # appends to `messages` do not mutate it after the fact.
+    call_inputs = []
 
     trace = {
         "run_id": datetime.now(timezone.utc).isoformat(),
@@ -171,11 +213,13 @@ def run_agent(email_body: str) -> dict:
     for iteration in range(1, max_iterations + 1):
         log.info("Iteration %d", iteration)
 
-        response = client.chat.completions.create(
+        call_inputs.append(copy.deepcopy(messages))
+
+        response = create_with_retry(
+            client,
             model=model,
             messages=messages,
             tools=TOOLS,
-            tool_choice="auto",
         )
 
         choice = response.choices[0]
@@ -235,7 +279,6 @@ def run_agent(email_body: str) -> dict:
                 log.warning("Unknown tool requested: %s", fn_name)
             else:
                 result = fn(**fn_args)
-
             result_str = json.dumps(result) if isinstance(result, dict) else str(result)
             log.info("Result: %s", result_str)
 
@@ -260,14 +303,21 @@ def run_agent(email_body: str) -> dict:
     return {
         "response": trace["final_response"],
         "messages": messages,
+        "call_inputs": call_inputs,
         "trace": trace,
     }
 
 
-# -- Main ---------------------------------------------------------------------
+# Entry point.
 
 def main():
-    result = run_agent(TEST_EMAIL)
+    try:
+        result = run_agent(TEST_EMAIL)
+    except RateLimitError:
+        # Groq free tier has a daily token cap. Exit cleanly rather than
+        # dumping a traceback; there is nothing to retry against a daily limit.
+        log.error("Groq rate limit reached. Wait for the quota to reset or upgrade the tier, then rerun.")
+        return
 
     print()
     print("AGENT RESPONSE")
@@ -281,7 +331,7 @@ def main():
     log.info("Wrote execution_trace.json")
 
     with open(os.path.join(base_dir, "raw_message_history.json"), "w") as f:
-        json.dump(result["messages"], f, indent=2)
+        json.dump(result["call_inputs"], f, indent=2)
     log.info("Wrote raw_message_history.json")
 
 
