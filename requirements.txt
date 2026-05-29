@@ -1,0 +1,5 @@
+# Python >= 3.10 required
+# Groq -- free tier with generous rate limits, OpenAI-compatible API
+
+groq==0.25.0
+python-dotenv==1.1.0
